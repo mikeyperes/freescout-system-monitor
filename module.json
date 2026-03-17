@@ -1,0 +1,11 @@
+{
+    "name": "SystemMonitor",
+    "alias": "systemmonitor",
+    "description": "Dashboard panels for cron status, email send/receive reports, recently viewed emails, and Telegram notifications.",
+    "version": "1.0.0",
+    "active": 1,
+    "detached": true,
+    "providers": [
+        "Modules\\SystemMonitor\\Providers\\SystemMonitorServiceProvider"
+    ]
+}
