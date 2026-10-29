@@ -19,6 +19,7 @@ class SystemMonitorServiceProvider extends ServiceProvider
 
         $this->registerCronTracking();
         $this->registerEmailViewTracking();
+        $this->registerStatusChangedTracking();
         $this->registerDashboardPanel();
         $this->registerDashboardJs();
         $this->registerCronLogCleanup();
@@ -113,6 +114,28 @@ class SystemMonitorServiceProvider extends ServiceProvider
                 // Silently fail
             }
         }, 20, 3);
+    }
+
+    /**
+     * Save prev_status into thread action_data so the dashboard can show "From → To".
+     */
+    protected function registerStatusChangedTracking()
+    {
+        \Eventy::addAction('conversation.status_changed', function ($conversation, $user, $changedOnReply, $prevStatus) {
+            try {
+                $thread = Thread::where('conversation_id', $conversation->id)
+                    ->where('action_type', Thread::ACTION_TYPE_STATUS_CHANGED)
+                    ->whereNull('action_data')
+                    ->latest('id')
+                    ->first();
+                if ($thread) {
+                    $thread->action_data = $prevStatus;
+                    $thread->save();
+                }
+            } catch (\Exception $e) {
+                // Silently fail
+            }
+        }, 30, 4);
     }
 
     /**
@@ -463,7 +486,9 @@ class SystemMonitorServiceProvider extends ServiceProvider
                     if ($t->action_type == Thread::ACTION_TYPE_STATUS_CHANGED) {
                         $event['type'] = 'status_changed';
                         $event['icon'] = 'glyphicon-random';
-                        $event['label'] = 'Status → ' . Conversation::statusCodeToName((int) $t->action_data);
+                        $fromName = $t->action_data ? Conversation::statusCodeToName((int) $t->action_data) : '?';
+                        $toName   = Conversation::statusCodeToName((int) $t->status);
+                        $event['label'] = 'Status: ' . $fromName . ' → ' . $toName;
                     } elseif ($t->action_type == Thread::ACTION_TYPE_USER_CHANGED) {
                         $event['type'] = 'assigned';
                         $event['icon'] = 'glyphicon-user';
@@ -600,7 +625,9 @@ class SystemMonitorServiceProvider extends ServiceProvider
 
         // ── 3. Activity logs (logins, errors, system events) ──
         // Only keep last login per user + failed logins + errors (no login spam)
+        // Exclude 'conversation_actions' — those are already shown via thread lineitems above.
         $activityLogs = \App\ActivityLog::where('created_at', '>=', $since)
+            ->where('log_name', '!=', 'conversation_actions')
             ->orderBy('created_at', 'desc')
             ->limit(50)
             ->get();
