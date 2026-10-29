@@ -1,0 +1,116 @@
+#!/bin/bash
+set -euo pipefail
+MODULE_ROOT="$(dirname "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")")"
+exec /usr/bin/python3 - "$MODULE_ROOT" "$@" <<'PYTHON'
+import argparse
+import datetime
+import fcntl
+import hashlib
+import json
+import os
+from pathlib import Path
+import re
+import subprocess
+import sys
+import tempfile
+
+module_root = Path(sys.argv.pop(1))
+parser = argparse.ArgumentParser(description="Email only newly logged FreeScout errors, retaining failed deliveries for retry.")
+parser.add_argument("--log-dir", type=Path, default=module_root.parent.parent / "storage/logs")
+parser.add_argument("--state-dir", type=Path, default=Path("/var/lib/hexa-freescout-monitor"))
+parser.add_argument("--dry-run", action="store_true", help="Show pending error counts without sending mail or advancing state")
+parser.add_argument("--initialize-current", action="store_true", help="Mark existing complete log entries as previously reported, without sending mail")
+args = parser.parse_args()
+if args.dry_run and args.initialize_current:
+    parser.error("--dry-run and --initialize-current cannot be combined")
+
+error_line = re.compile(rb"^\[[^\]]+\]\s+\S+\.(?:ERROR|CRITICAL|ALERT|EMERGENCY):")
+log_name = re.compile(r"laravel-\d{4}-\d{2}-\d{2}\.log\Z")
+
+
+def save_state(path, records):
+    descriptor, temporary = tempfile.mkstemp(prefix=".errors-", dir=str(path.parent))
+    try:
+        with os.fdopen(descriptor, "w") as stream:
+            json.dump({"version": 1, "logs": records}, stream, sort_keys=True)
+            stream.write("\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, str(path))
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
+
+
+def monitor():
+    if not args.log_dir.is_dir():
+        raise RuntimeError("FreeScout log directory is missing: " + str(args.log_dir))
+    state_path = args.state_dir / "state.json"
+    state = json.loads(state_path.read_text()) if state_path.exists() else {"version": 1, "logs": {}}
+    if state.get("version") != 1 or not isinstance(state.get("logs"), dict):
+        raise RuntimeError("Unsupported or invalid monitor state; refusing to discard delivery history")
+    records = {}
+    new_errors = []
+    for path in sorted(args.log_dir.iterdir()):
+        if not log_name.fullmatch(path.name) or not path.is_file():
+            continue
+        key = str(path.resolve())
+        previous = state["logs"].get(key, {})
+        with path.open("rb") as stream:
+            stat = os.fstat(stream.fileno())
+            offset = previous.get("offset", 0)
+            identity = [stat.st_dev, stat.st_ino]
+            if previous.get("identity") != identity or stat.st_size < offset:
+                offset = 0
+            # Detect same-inode truncate/rewrite even when the new file is larger.
+            if offset:
+                stream.seek(max(0, offset - 256))
+                anchor = hashlib.sha256(stream.read(min(offset, 256))).hexdigest()
+                if anchor != previous.get("anchor"):
+                    offset = 0
+            stream.seek(offset)
+            # Bound the read to this snapshot; entries appended during mail delivery
+            # are left pending for the next invocation.
+            data = stream.read(stat.st_size - offset)
+            complete_end = data.rfind(b"\n") + 1
+            complete = data[:complete_end]
+            position = offset + complete_end
+            if not args.initialize_current:
+                for line in complete.splitlines():
+                    if error_line.match(line):
+                        new_errors.append((path.name, line.decode("utf-8", errors="replace")))
+            stream.seek(max(0, position - 256))
+            anchor = hashlib.sha256(stream.read(min(position, 256))).hexdigest()
+            records[key] = {"identity": identity, "offset": position, "anchor": anchor}
+    if args.initialize_current:
+        save_state(state_path, records)
+        print(json.dumps({"initialized_logs": len(records), "mail_sent": False}))
+        return 0
+    if args.dry_run:
+        print(json.dumps({"new_errors": len(new_errors), "tracked_logs": len(records), "mail_sent": False, "state_advanced": False}))
+        return 0
+    if new_errors:
+        body = "FreeScout has {} new error(s) since the last successful alert.\n\nLast 5 new errors:\n{}\n\nLog directory: {}\n".format(
+            len(new_errors), "\n".join("{}: {}".format(name, line) for name, line in new_errors[-5:]), args.log_dir
+        )
+        result = subprocess.run(
+            ["mail", "-s", "FreeScout Errors Detected", "-r", "support@hexacloudservices.com", "michael@mike-ro-tech.com"],
+            input=body, universal_newlines=True
+        )
+        if result.returncode:
+            print("Alert delivery failed; log positions were retained for retry", file=sys.stderr)
+            return result.returncode
+    save_state(state_path, records)
+    print(json.dumps({"new_errors": len(new_errors), "mail_sent": bool(new_errors)}))
+    return 0
+
+
+try:
+    args.state_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+    with (args.state_dir / "monitor.lock").open("a") as lock:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        sys.exit(monitor())
+except (OSError, ValueError, RuntimeError) as error:
+    print("FreeScout error monitor: " + str(error), file=sys.stderr)
+    sys.exit(1)
+PYTHON
